@@ -23,6 +23,12 @@ python.install_sources(
   subdir: 'gnome_query_builder/model',
 )
 
+python.install_sources(
+  'gnome_query_builder/ui/__init__.py',
+  'gnome_query_builder/ui/canvas.py',
+  subdir: 'gnome_query_builder/ui',
+)
+
 configure_file(
   input: 'gnome-query-builder.in',
   output: 'gnome-query-builder',

@@ -18,7 +18,7 @@ Build/install uses **Meson** (native packaging first). Flatpak is intentionally 
 1. Adwaita application window + header bar  
 2. Databricks backend seam: **CLI profile / SDK** when credentials exist, else **mock UC metadata** so the UI works offline (`--mock`)  
 3. Browse UC: catalog → schema → table  
-4. Add/remove tables on a minimal join graph (list + editable join keys)  
+4. **Join canvas** (GtkDrawingArea): table nodes, join edges with type/keys; drag nodes; edit selected edge  
 5. Emit Spark SQL with explicit `JOIN`s and `` `catalog`.`schema`.`table` `` names  
 6. Run on a SQL warehouse with a **LIMIT** guardrail (mock runner offline)  
 7. Save / load local `.sql` files  
@@ -97,6 +97,7 @@ gnome-query-builder/
     application.py / window.py
     databricks/     # Protocol + mock + SDK
     model/          # JoinGraph + Spark SQL emit
+    ui/             # JoinCanvas (DrawingArea)
   data/             # .desktop
   scripts/run.sh
   tests/

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Minimal join graph: ordered tables + pairwise join keys (not a full canvas)."""
+"""Join graph: tables as canvas nodes + pairwise join edges (type + keys)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ class GraphTable:
     ref: TableRef
     alias: str
     columns: list[str] = field(default_factory=list)
+    # Canvas layout (GtkDrawingArea coordinates)
+    x: float = 0.0
+    y: float = 0.0
+    placed: bool = False
 
 
 @dataclass
@@ -32,6 +36,12 @@ class JoinGraph:
     def aliases(self) -> set[str]:
         return {t.alias for t in self.tables}
 
+    def table_by_alias(self, alias: str) -> GraphTable | None:
+        for t in self.tables:
+            if t.alias == alias:
+                return t
+        return None
+
     def next_alias(self, table_name: str) -> str:
         base = "".join(ch for ch in table_name if ch.isalnum() or ch == "_") or "t"
         base = base[:12].lower()
@@ -44,6 +54,11 @@ class JoinGraph:
 
     def add_table(self, ref: TableRef, columns: list[str] | None = None) -> GraphTable:
         gt = GraphTable(ref=ref, alias=self.next_alias(ref.name), columns=list(columns or []))
+        # Stagger new nodes left-to-right; canvas marks placed=True on layout.
+        i = len(self.tables)
+        gt.x = 40.0 + (i % 3) * 280.0
+        gt.y = 36.0 + (i // 3) * 160.0
+        gt.placed = True
         self.tables.append(gt)
         return gt
 
@@ -74,8 +89,12 @@ class JoinGraph:
         prev = self.tables[-2]
         edge = self.suggest_join(prev, new)
         if edge is None:
-            # Placeholder keys so SQL still emits; user can edit in the join list.
+            # Placeholder keys so SQL still emits; user can edit on the canvas.
             left_col = prev.columns[0] if prev.columns else "id"
             right_col = new.columns[0] if new.columns else "id"
             edge = JoinEdge(prev.alias, left_col, new.alias, right_col)
         self.edges.append(edge)
+
+    def set_join_type(self, edge_index: int, join_type: str) -> None:
+        if 0 <= edge_index < len(self.edges):
+            self.edges[edge_index].join_type = join_type.upper()

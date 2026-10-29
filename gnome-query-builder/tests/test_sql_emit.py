@@ -40,6 +40,23 @@ class SqlEmitTests(unittest.TestCase):
         sql = emit_spark_sql(JoinGraph())
         self.assertTrue(sql.lstrip().startswith("--"))
 
+    def test_left_join_type_emitted(self) -> None:
+        g = JoinGraph()
+        g.add_table(
+            TableRef("main", "default", "customers"),
+            columns=["customer_id", "name"],
+        )
+        orders = g.add_table(
+            TableRef("main", "default", "orders"),
+            columns=["order_id", "customer_id", "amount"],
+        )
+        g.ensure_edge_for_new_table(orders)
+        g.set_join_type(0, "LEFT")
+        sql = emit_spark_sql(g)
+        self.assertIn("LEFT JOIN `main`.`default`.`orders` AS `orders`", sql)
+        self.assertTrue(g.tables[0].placed)
+        self.assertNotEqual((g.tables[0].x, g.tables[0].y), (g.tables[1].x, g.tables[1].y))
+
 
 if __name__ == "__main__":
     unittest.main()
