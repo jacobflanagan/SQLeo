@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Main Adwaita window: UC browser, join list, SQL pane, results, save/load."""
+"""Main Adwaita window: UC browser, join canvas, SQL pane, results, save/load."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from gnome_query_builder.databricks.base import (  # noqa: E402
 )
 from gnome_query_builder.model.join_graph import JoinGraph  # noqa: E402
 from gnome_query_builder.model.sql_emit import emit_spark_sql  # noqa: E402
+from gnome_query_builder.ui.canvas import JOIN_TYPES, JoinCanvas  # noqa: E402
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -29,7 +30,7 @@ class MainWindow(Adw.ApplicationWindow):
         default_limit: int = 100,
     ) -> None:
         super().__init__(application=application, title="GNOME Query Builder")
-        self.set_default_size(1200, 800)
+        self.set_default_size(1280, 860)
 
         self._backend = backend
         self._graph = JoinGraph()
@@ -37,6 +38,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._sql_dirty_from_user = False
         self._current_path: Path | None = None
         self._warehouses: list[tuple[str, str]] = []
+        self._updating_join_props = False
 
         self._build_chrome()
         self._build_body()
@@ -93,7 +95,7 @@ class MainWindow(Adw.ApplicationWindow):
         banner = Adw.Banner(
             title=(
                 f"Backend: {self._backend.mode} — "
-                "browse UC, add two tables, edit join keys, run with LIMIT, save .sql"
+                "drag table nodes, click join edges to edit type/keys, SQL always visible"
             )
         )
         banner.set_revealed(True)
@@ -118,7 +120,6 @@ class MainWindow(Adw.ApplicationWindow):
         left_label.add_css_class("heading")
         left.append(left_label)
 
-        # TreeStore + TreeView is enough for the spike; TreeListModel can come later.
         self._tree = Gtk.TreeView()
         self._tree.set_headers_visible(False)
         self._tree.set_vexpand(True)
@@ -134,18 +135,19 @@ class MainWindow(Adw.ApplicationWindow):
         scroll_tree.add_css_class("card")
         left.append(scroll_tree)
 
-        add_btn = Gtk.Button(label="Add table to graph")
+        add_btn = Gtk.Button(label="Add table to canvas")
         add_btn.connect("clicked", lambda *_: self._add_selected_table())
         left.append(add_btn)
 
         paned.set_start_child(left)
 
-        # Right: join graph + SQL + results
+        # Right: join canvas + join props + SQL + results
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         paned.set_end_child(right)
 
         vpaned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
         vpaned.set_vexpand(True)
+        vpaned.set_position(420)
         right.append(vpaned)
 
         mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -154,23 +156,61 @@ class MainWindow(Adw.ApplicationWindow):
         mid.set_margin_end(8)
         vpaned.set_start_child(mid)
 
-        graph_label = Gtk.Label(label="Join graph (tables + keys)", xalign=0.0)
+        graph_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        graph_label = Gtk.Label(label="Join canvas", xalign=0.0, hexpand=True)
         graph_label.add_css_class("heading")
-        mid.append(graph_label)
+        graph_header.append(graph_label)
 
-        self._graph_list = Gtk.ListBox()
-        self._graph_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self._graph_list.add_css_class("boxed-list")
-        mid.append(self._graph_list)
+        remove_btn = Gtk.Button(
+            icon_name="user-trash-symbolic",
+            tooltip_text="Remove selected table or join",
+        )
+        remove_btn.connect("clicked", lambda *_: self._on_remove_selected())
+        graph_header.append(remove_btn)
+        mid.append(graph_header)
 
-        join_label = Gtk.Label(label="Joins", xalign=0.0)
-        join_label.add_css_class("heading")
-        mid.append(join_label)
+        self._canvas = JoinCanvas()
+        self._canvas.set_graph(self._graph)
+        self._canvas.connect("graph-changed", self._on_canvas_graph_changed)
+        self._canvas.connect("selection-changed", self._on_canvas_selection_changed)
 
-        self._join_list = Gtk.ListBox()
-        self._join_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self._join_list.add_css_class("boxed-list")
-        mid.append(self._join_list)
+        canvas_scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True, min_content_height=220)
+        canvas_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        canvas_scroll.set_child(self._canvas)
+        canvas_scroll.add_css_class("card")
+        mid.append(canvas_scroll)
+
+        # Join edge property bar (visible when an edge is selected)
+        self._join_props = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._join_props.set_margin_top(2)
+        self._join_props.append(Gtk.Label(label="Join", xalign=0.0))
+
+        self._join_type_dd = Gtk.DropDown.new_from_strings(list(JOIN_TYPES))
+        self._join_type_dd.set_size_request(110, -1)
+        self._join_type_dd.connect("notify::selected", self._on_join_type_changed)
+        self._join_props.append(self._join_type_dd)
+
+        self._join_left_entry = Gtk.Entry(placeholder_text="left key")
+        self._join_left_entry.set_width_chars(14)
+        self._join_left_entry.connect("changed", self._on_join_key_changed)
+        self._join_props.append(self._join_left_entry)
+
+        self._join_props.append(Gtk.Label(label="="))
+
+        self._join_right_entry = Gtk.Entry(placeholder_text="right key")
+        self._join_right_entry.set_width_chars(14)
+        self._join_right_entry.connect("changed", self._on_join_key_changed)
+        self._join_props.append(self._join_right_entry)
+
+        hint = Gtk.Label(
+            label="Click an edge · Ctrl+click cycles type",
+            xalign=0.0,
+            hexpand=True,
+        )
+        hint.add_css_class("dim-label")
+        self._join_props.append(hint)
+        mid.append(self._join_props)
+        self._join_props.set_sensitive(False)
 
         sql_label = Gtk.Label(label="Spark SQL (editable — source of truth)", xalign=0.0)
         sql_label.add_css_class("heading")
@@ -186,12 +226,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._sql_buffer = self._sql_view.get_buffer()
         self._sql_buffer.connect("changed", self._on_sql_edited)
 
-        sql_scroll = Gtk.ScrolledWindow(vexpand=True, min_content_height=160)
+        sql_scroll = Gtk.ScrolledWindow(vexpand=True, min_content_height=140)
         sql_scroll.set_child(self._sql_view)
         sql_scroll.add_css_class("card")
         mid.append(sql_scroll)
 
-        sync_btn = Gtk.Button(label="Regenerate SQL from graph")
+        sync_btn = Gtk.Button(label="Regenerate SQL from canvas")
         sync_btn.connect("clicked", lambda *_: self._refresh_sql_from_graph(force=True))
         mid.append(sync_btn)
 
@@ -208,7 +248,6 @@ class MainWindow(Adw.ApplicationWindow):
         bottom.append(self._results_label)
 
         self._results_scroll = Gtk.ScrolledWindow(vexpand=True, min_content_height=140)
-        # Spike: simple TreeView for results grid
         self._results_view = Gtk.TreeView()
         self._results_scroll.set_child(self._results_view)
         self._results_scroll.add_css_class("card")
@@ -284,75 +323,71 @@ class MainWindow(Adw.ApplicationWindow):
             cols = []
         gt = self._graph.add_table(ref, columns=cols)
         self._graph.ensure_edge_for_new_table(gt)
-        self._rebuild_graph_ui()
+        self._canvas.refresh()
         self._refresh_sql_from_graph()
         self._toast_msg(f"Added {ref.fqn} as `{gt.alias}`")
 
-    # --- join graph UI ----------------------------------------------------------
+    # --- canvas / join props ----------------------------------------------------
 
-    def _rebuild_graph_ui(self) -> None:
-        while (child := self._graph_list.get_first_child()) is not None:
-            self._graph_list.remove(child)
-        while (child := self._join_list.get_first_child()) is not None:
-            self._join_list.remove(child)
+    def _on_canvas_graph_changed(self, *_args) -> None:
+        self._refresh_sql_from_graph()
+        self._sync_join_props_from_selection()
 
-        for t in self._graph.tables:
-            row = Adw.ActionRow(
-                title=t.ref.fqn,
-                subtitle=f"alias `{t.alias}` · {len(t.columns)} columns",
-            )
-            remove = Gtk.Button(icon_name="user-trash-symbolic")
-            remove.set_valign(Gtk.Align.CENTER)
-            alias = t.alias
+    def _on_canvas_selection_changed(self, *_args) -> None:
+        self._sync_join_props_from_selection()
 
-            def _rm(_btn, a=alias) -> None:
-                self._graph.remove_alias(a)
-                self._rebuild_graph_ui()
-                self._refresh_sql_from_graph()
+    def _sync_join_props_from_selection(self) -> None:
+        edge = self._canvas.selected_edge
+        self._updating_join_props = True
+        try:
+            if edge is None:
+                self._join_props.set_sensitive(False)
+                self._join_left_entry.set_text("")
+                self._join_right_entry.set_text("")
+                return
+            self._join_props.set_sensitive(True)
+            jt = edge.join_type.upper()
+            try:
+                idx = list(JOIN_TYPES).index(jt)
+            except ValueError:
+                idx = 0
+            self._join_type_dd.set_selected(idx)
+            self._join_left_entry.set_text(edge.left_column)
+            self._join_right_entry.set_text(edge.right_column)
+        finally:
+            self._updating_join_props = False
 
-            remove.connect("clicked", _rm)
-            row.add_suffix(remove)
-            self._graph_list.append(row)
+    def _on_join_type_changed(self, *_args) -> None:
+        if self._updating_join_props:
+            return
+        idx = self._canvas.selected_edge_index
+        if idx is None:
+            return
+        sel = self._join_type_dd.get_selected()
+        if 0 <= sel < len(JOIN_TYPES):
+            self._graph.set_join_type(idx, JOIN_TYPES[sel])
+            self._canvas.queue_draw()
+            self._refresh_sql_from_graph()
 
-        for idx, edge in enumerate(self._graph.edges):
-            row = Adw.ActionRow(
-                title=f"{edge.join_type} JOIN",
-                subtitle=(
-                    f"`{edge.left_alias}`.`{edge.left_column}` = "
-                    f"`{edge.right_alias}`.`{edge.right_column}`"
-                ),
-            )
-            left_entry = Gtk.Entry()
-            left_entry.set_text(edge.left_column)
-            left_entry.set_width_chars(12)
-            left_entry.set_valign(Gtk.Align.CENTER)
-            right_entry = Gtk.Entry()
-            right_entry.set_text(edge.right_column)
-            right_entry.set_width_chars(12)
-            right_entry.set_valign(Gtk.Align.CENTER)
+    def _on_join_key_changed(self, *_args) -> None:
+        if self._updating_join_props:
+            return
+        edge = self._canvas.selected_edge
+        if edge is None:
+            return
+        edge.left_column = self._join_left_entry.get_text().strip() or "id"
+        edge.right_column = self._join_right_entry.get_text().strip() or "id"
+        self._canvas.queue_draw()
+        self._refresh_sql_from_graph()
 
-            def _upd_left(entry, i=idx) -> None:
-                self._graph.edges[i].left_column = entry.get_text().strip() or "id"
-                self._refresh_sql_from_graph()
-
-            def _upd_right(entry, i=idx) -> None:
-                self._graph.edges[i].right_column = entry.get_text().strip() or "id"
-                self._refresh_sql_from_graph()
-
-            left_entry.connect("changed", _upd_left)
-            right_entry.connect("changed", _upd_right)
-            row.add_suffix(left_entry)
-            row.add_suffix(Gtk.Label(label="="))
-            row.add_suffix(right_entry)
-            self._join_list.append(row)
-
-        if not self._graph.tables:
-            self._graph_list.append(
-                Adw.ActionRow(
-                    title="No tables yet",
-                    subtitle="Double-click a table or use Add table to graph",
-                )
-            )
+    def _on_remove_selected(self) -> None:
+        before_tables = len(self._graph.tables)
+        before_edges = len(self._graph.edges)
+        self._canvas.remove_selected()
+        if len(self._graph.tables) < before_tables or len(self._graph.edges) < before_edges:
+            self._toast_msg("Removed from canvas")
+        else:
+            self._toast_msg("Select a table node or join edge first")
 
     # --- SQL --------------------------------------------------------------------
 
@@ -421,7 +456,6 @@ class MainWindow(Adw.ApplicationWindow):
             values = [str(row[i]) if i < len(row) else "" for i in range(len(columns))]
             store.append(values)
 
-        # Rebuild columns
         view = self._results_view
         for col in list(view.get_columns()):
             view.remove_column(col)
