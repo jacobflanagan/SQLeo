@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -13,12 +15,14 @@ from gi.repository import Gdk, GObject, Gtk  # noqa: E402
 from gnome_query_builder.model.join_graph import GraphTable, JoinEdge, JoinGraph  # noqa: E402
 
 NODE_W = 200.0
-NODE_H_BASE = 56.0
+HEADER_H = 28.0
+FQN_BASELINE = 42.0
+COL_FIRST_BASELINE = 58.0
 NODE_COL_H = 16.0
 NODE_MAX_COLS = 6
 NODE_PAD = 10.0
-PORT_R = 5.0
-HIT_EDGE_PX = 14.0
+PORT_R = 4.5
+HIT_EDGE_PX = 16.0
 
 JOIN_TYPES = ("INNER", "LEFT", "RIGHT", "FULL")
 
@@ -26,15 +30,93 @@ JOIN_TYPES = ("INNER", "LEFT", "RIGHT", "FULL")
 def _node_height(table: GraphTable) -> float:
     n = min(len(table.columns), NODE_MAX_COLS)
     extra = 14.0 if len(table.columns) > NODE_MAX_COLS else 0.0
-    return NODE_H_BASE + n * NODE_COL_H + extra
+    # Space through last visible column baseline + padding
+    body = COL_FIRST_BASELINE + max(n, 1) * NODE_COL_H + extra - HEADER_H
+    return HEADER_H + max(body, 40.0)
 
 
-def _port_left(table: GraphTable) -> tuple[float, float]:
-    return (table.x, table.y + _node_height(table) / 2.0)
+def _column_index(table: GraphTable, column: str) -> int | None:
+    name = (column or "").strip()
+    if not name:
+        return None
+    for i, col in enumerate(table.columns[:NODE_MAX_COLS]):
+        if col == name:
+            return i
+    # Join key exists but scrolled off visible list — pin to last visible row.
+    if name in table.columns and table.columns:
+        return min(len(table.columns), NODE_MAX_COLS) - 1
+    return None
 
 
-def _port_right(table: GraphTable) -> tuple[float, float]:
-    return (table.x + NODE_W, table.y + _node_height(table) / 2.0)
+def _column_port_y(table: GraphTable, column: str) -> float:
+    """Vertical center of the join-key column row (or node mid as fallback)."""
+    idx = _column_index(table, column)
+    if idx is None:
+        return table.y + _node_height(table) / 2.0
+    # Text baseline is at COL_FIRST_BASELINE + i*H; center the port on the glyph box.
+    baseline = table.y + COL_FIRST_BASELINE + idx * NODE_COL_H
+    return baseline - 4.0
+
+
+def _port(
+    table: GraphTable, column: str, *, side: str
+) -> tuple[float, float]:
+    y = _column_port_y(table, column)
+    if side == "left":
+        return (table.x, y)
+    return (table.x + NODE_W, y)
+
+
+def _edge_endpoints(
+    left: GraphTable, right: GraphTable, edge: JoinEdge
+) -> tuple[tuple[float, float], tuple[float, float], str, str]:
+    """Return (start, end, start_side, end_side) for drawing left→right join."""
+    # Attach to the side facing the other node; Y follows join key columns.
+    if left.x + NODE_W / 2.0 <= right.x + NODE_W / 2.0:
+        start = _port(left, edge.left_column, side="right")
+        end = _port(right, edge.right_column, side="left")
+        return start, end, "right", "left"
+    start = _port(left, edge.left_column, side="left")
+    end = _port(right, edge.right_column, side="right")
+    return start, end, "left", "right"
+
+
+def _bezier_point(
+    t: float,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+) -> tuple[float, float]:
+    u = 1.0 - t
+    x = (
+        u * u * u * p0[0]
+        + 3 * u * u * t * p1[0]
+        + 3 * u * t * t * p2[0]
+        + t * t * t * p3[0]
+    )
+    y = (
+        u * u * u * p0[1]
+        + 3 * u * u * t * p1[1]
+        + 3 * u * t * t * p2[1]
+        + t * t * t * p3[1]
+    )
+    return (x, y)
+
+
+def _bezier_controls(
+    x1: float, y1: float, x2: float, y2: float
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Horizontal-ish cubic controls so the curve leaves/enters ports orthogonally."""
+    dx = abs(x2 - x1)
+    pull = max(40.0, min(120.0, dx * 0.45))
+    if x1 <= x2:
+        c1 = (x1 + pull, y1)
+        c2 = (x2 - pull, y2)
+    else:
+        c1 = (x1 - pull, y1)
+        c2 = (x2 + pull, y2)
+    return c1, c2
 
 
 def _table_by_alias(graph: JoinGraph, alias: str) -> GraphTable | None:
@@ -49,10 +131,29 @@ def _dist_point_seg(
 ) -> float:
     dx, dy = x2 - x1, y2 - y1
     if dx == 0 and dy == 0:
-        return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+        return math.hypot(px - x1, py - y1)
     t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
     qx, qy = x1 + t * dx, y1 + t * dy
-    return ((px - qx) ** 2 + (py - qy) ** 2) ** 0.5
+    return math.hypot(px - qx, py - qy)
+
+
+def _dist_point_bezier(
+    px: float,
+    py: float,
+    p0: tuple[float, float],
+    c1: tuple[float, float],
+    c2: tuple[float, float],
+    p3: tuple[float, float],
+    *,
+    samples: int = 24,
+) -> float:
+    best = float("inf")
+    prev = p0
+    for i in range(1, samples + 1):
+        pt = _bezier_point(i / samples, p0, c1, c2, p3)
+        best = min(best, _dist_point_seg(px, py, prev[0], prev[1], pt[0], pt[1]))
+        prev = pt
+    return best
 
 
 class JoinCanvas(Gtk.DrawingArea):
@@ -97,7 +198,6 @@ class JoinCanvas(Gtk.DrawingArea):
         motion.connect("motion", self._on_motion)
         self.add_controller(motion)
 
-        # CSS-ish cursor hint via CSS name
         self.add_css_class("join-canvas")
 
     # --- public API -------------------------------------------------------------
@@ -171,11 +271,6 @@ class JoinCanvas(Gtk.DrawingArea):
 
     def _layout_if_needed(self) -> None:
         for i, t in enumerate(self._graph.tables):
-            if t.x == 0.0 and t.y == 0.0 and i > 0:
-                # Only auto-place when still at origin and not the first table
-                # that intentionally sits at (40,40) — check placed flag via
-                # whether any non-default position exists.
-                pass
             if not t.placed:
                 t.x = 40.0 + (i % 3) * (NODE_W + 80.0)
                 t.y = 36.0 + (i // 3) * 160.0
@@ -192,10 +287,18 @@ class JoinCanvas(Gtk.DrawingArea):
         self.set_content_width(max(720, int(max_x)))
         self.set_content_height(max(360, int(max_y)))
 
+    def _edge_geometry(self, edge: JoinEdge):
+        left = _table_by_alias(self._graph, edge.left_alias)
+        right = _table_by_alias(self._graph, edge.right_alias)
+        if left is None or right is None:
+            return None
+        (x1, y1), (x2, y2), _, _ = _edge_endpoints(left, right, edge)
+        c1, c2 = _bezier_controls(x1, y1, x2, y2)
+        return (x1, y1), c1, c2, (x2, y2), left, right
+
     # --- hit testing ------------------------------------------------------------
 
     def _hit_node(self, x: float, y: float) -> GraphTable | None:
-        # Top-most last
         for t in reversed(self._graph.tables):
             h = _node_height(t)
             if t.x <= x <= t.x + NODE_W and t.y <= y <= t.y + h:
@@ -206,18 +309,14 @@ class JoinCanvas(Gtk.DrawingArea):
         best_i: int | None = None
         best_d = HIT_EDGE_PX
         for i, edge in enumerate(self._graph.edges):
-            left = _table_by_alias(self._graph, edge.left_alias)
-            right = _table_by_alias(self._graph, edge.right_alias)
-            if left is None or right is None:
+            geom = self._edge_geometry(edge)
+            if geom is None:
                 continue
-            # Prefer connecting right port of left-side node → left port of right
-            if left.x <= right.x:
-                x1, y1 = _port_right(left)
-                x2, y2 = _port_left(right)
-            else:
-                x1, y1 = _port_left(left)
-                x2, y2 = _port_right(right)
-            d = _dist_point_seg(x, y, x1, y1, x2, y2)
+            p0, c1, c2, p3, _left, _right = geom
+            d = _dist_point_bezier(x, y, p0, c1, c2, p3)
+            # Also accept hits on the join chip around the curve midpoint.
+            mx, my = _bezier_point(0.5, p0, c1, c2, p3)
+            d = min(d, math.hypot(x - mx, y - my) - 10.0)
             if d < best_d:
                 best_d = d
                 best_i = i
@@ -226,6 +325,15 @@ class JoinCanvas(Gtk.DrawingArea):
     # --- events -----------------------------------------------------------------
 
     def _on_click_pressed(self, _gesture, _n: int, x: float, y: float) -> None:
+        # Prefer edges over nodes when clicking near a join chip/line so selection
+        # of joins isn't swallowed by overlapping node bounds.
+        edge_i = self._hit_edge(x, y)
+        if edge_i is not None:
+            self._selected_alias = None
+            self._selected_edge_idx = edge_i
+            self.queue_draw()
+            self.emit("selection-changed")
+            return
         node = self._hit_node(x, y)
         if node is not None:
             self._selected_alias = node.alias
@@ -233,18 +341,14 @@ class JoinCanvas(Gtk.DrawingArea):
             self.queue_draw()
             self.emit("selection-changed")
             return
-        edge_i = self._hit_edge(x, y)
         self._selected_alias = None
-        self._selected_edge_idx = edge_i
+        self._selected_edge_idx = None
         self.queue_draw()
         self.emit("selection-changed")
 
     def _on_click_released(self, gesture, _n: int, x: float, y: float) -> None:
-        # Double-click edge cycles join type
         if gesture.get_current_event() is None:
             return
-        # Gtk.GestureClick exposes n_presses via the pressed handler; use
-        # a simple secondary: Ctrl+click cycles join type on edge.
         state = gesture.get_current_event_state()
         if state & Gdk.ModifierType.CONTROL_MASK:
             edge_i = self._hit_edge(x, y)
@@ -253,11 +357,17 @@ class JoinCanvas(Gtk.DrawingArea):
                 self.cycle_selected_join_type()
 
     def _on_drag_begin(self, gesture, x: float, y: float) -> None:
+        # Don't start a node drag when the pointer is on a join edge/chip.
+        if self._hit_edge(x, y) is not None and self._hit_node(x, y) is None:
+            self._drag_alias = None
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
         node = self._hit_node(x, y)
         if node is None:
             self._drag_alias = None
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
+        # If clicking a port/column row near an edge, still allow drag from node body.
         self._drag_alias = node.alias
         self._drag_origin_x = node.x
         self._drag_origin_y = node.y
@@ -276,6 +386,7 @@ class JoinCanvas(Gtk.DrawingArea):
         node.y = max(8.0, self._drag_origin_y + offset_y)
         node.placed = True
         self._update_content_size()
+        # Edges recompute from live node positions on every draw.
         self.queue_draw()
 
     def _on_drag_end(self, *_args) -> None:
@@ -293,12 +404,10 @@ class JoinCanvas(Gtk.DrawingArea):
     # --- drawing ----------------------------------------------------------------
 
     def _on_draw(self, _area, cr, width: int, height: int) -> None:
-        # Background
         cr.set_source_rgb(0.96, 0.96, 0.97)
         cr.rectangle(0, 0, width, height)
         cr.fill()
 
-        # Subtle grid
         cr.set_source_rgba(0.75, 0.78, 0.82, 0.45)
         cr.set_line_width(1.0)
         step = 24
@@ -320,60 +429,101 @@ class JoinCanvas(Gtk.DrawingArea):
             cr.show_text(msg)
             return
 
-        # Edges under nodes
+        # Curves under nodes; chips/arrows after so labels stay readable.
         for i, edge in enumerate(self._graph.edges):
-            self._draw_edge(cr, edge, selected=(i == self._selected_edge_idx))
+            self._draw_edge(
+                cr, edge, selected=(i == self._selected_edge_idx), phase="curve"
+            )
 
+        active_ports = self._active_ports()
         for t in self._graph.tables:
             self._draw_node(
                 cr,
                 t,
                 selected=(t.alias == self._selected_alias),
                 hover=(t.alias == self._hover_alias),
+                active_ports=active_ports.get(t.alias, set()),
             )
 
-    def _draw_edge(self, cr, edge: JoinEdge, *, selected: bool) -> None:
-        left = _table_by_alias(self._graph, edge.left_alias)
-        right = _table_by_alias(self._graph, edge.right_alias)
-        if left is None or right is None:
+        for i, edge in enumerate(self._graph.edges):
+            self._draw_edge(
+                cr, edge, selected=(i == self._selected_edge_idx), phase="overlay"
+            )
+
+    def _active_ports(self) -> dict[str, set[tuple[str, str]]]:
+        """Map alias → {(side, column)} for ports used by edges."""
+        out: dict[str, set[tuple[str, str]]] = {}
+        for edge in self._graph.edges:
+            left = _table_by_alias(self._graph, edge.left_alias)
+            right = _table_by_alias(self._graph, edge.right_alias)
+            if left is None or right is None:
+                continue
+            _s, _e, start_side, end_side = _edge_endpoints(left, right, edge)
+            out.setdefault(edge.left_alias, set()).add((start_side, edge.left_column))
+            out.setdefault(edge.right_alias, set()).add((end_side, edge.right_column))
+        return out
+
+    def _draw_edge(
+        self, cr, edge: JoinEdge, *, selected: bool, phase: str = "all"
+    ) -> None:
+        geom = self._edge_geometry(edge)
+        if geom is None:
+            return
+        (x1, y1), c1, c2, (x2, y2), _left, _right = geom
+
+        if phase in ("all", "curve"):
+            if selected:
+                cr.set_source_rgb(0.18, 0.45, 0.85)
+                cr.set_line_width(3.0)
+            else:
+                cr.set_source_rgb(0.35, 0.45, 0.55)
+                cr.set_line_width(2.0)
+            cr.move_to(x1, y1)
+            cr.curve_to(c1[0], c1[1], c2[0], c2[1], x2, y2)
+            cr.stroke()
+
+        if phase not in ("all", "overlay"):
             return
 
-        if left.x <= right.x:
-            x1, y1 = _port_right(left)
-            x2, y2 = _port_left(right)
-        else:
-            x1, y1 = _port_left(left)
-            x2, y2 = _port_right(right)
-
-        mx = (x1 + x2) / 2.0
+        # Arrow at end, oriented along the final tangent (c2 → end).
+        # Stop just short of the port so the arrow doesn't swallow the dot.
+        tx, ty = x2 - c2[0], y2 - c2[1]
+        length = math.hypot(tx, ty) or 1.0
+        ux, uy = tx / length, ty / length
+        px, py = -uy, ux
+        tip = (x2 - ux * (PORT_R + 1.0), y2 - uy * (PORT_R + 1.0))
+        back = (tip[0] - ux * 9.0, tip[1] - uy * 9.0)
         if selected:
             cr.set_source_rgb(0.18, 0.45, 0.85)
-            cr.set_line_width(3.0)
         else:
             cr.set_source_rgb(0.35, 0.45, 0.55)
-            cr.set_line_width(2.0)
-
-        cr.move_to(x1, y1)
-        cr.curve_to(mx, y1, mx, y2, x2, y2)
-        cr.stroke()
-
-        # Arrow tip at end
         cr.set_line_width(2.0)
-        cr.move_to(x2, y2)
-        cr.line_to(x2 - 8, y2 - 5)
-        cr.move_to(x2, y2)
-        cr.line_to(x2 - 8, y2 + 5)
+        cr.move_to(tip[0], tip[1])
+        cr.line_to(back[0] + px * 4.5, back[1] + py * 4.5)
+        cr.move_to(tip[0], tip[1])
+        cr.line_to(back[0] - px * 4.5, back[1] - py * 4.5)
         cr.stroke()
 
-        # Label chip
-        label = f"{edge.join_type}  {edge.left_column} = {edge.right_column}"
+        # Join chip on the bezier midpoint (drawn above nodes).
+        mx, my = _bezier_point(0.5, (x1, y1), c1, c2, (x2, y2))
+        left_col = edge.left_column
+        right_col = edge.right_column
+        if len(left_col) > 16:
+            left_col = left_col[:14] + "…"
+        if len(right_col) > 16:
+            right_col = right_col[:14] + "…"
+        label = f"{edge.join_type}  {left_col} = {right_col}"
         cr.select_font_face("Sans", 0, 0)
         cr.set_font_size(11)
         te = cr.text_extents(label)
-        lx = mx - te.width / 2 - 6
-        ly = (y1 + y2) / 2 - 10
-        pad_x, pad_y = 6, 3
+        pad_x, pad_y = 7, 4
         w, h = te.width + pad_x * 2, te.height + pad_y * 2
+        lx = mx - w / 2
+        ly = my - h / 2 - 2
+        # Soft shadow so chip reads over the curve/grid
+        cr.set_source_rgba(0, 0, 0, 0.10)
+        self._round_rect(cr, lx + 1, ly + 1, w, h, 4)
+        cr.fill()
         self._round_rect(cr, lx, ly, w, h, 4)
         if selected:
             cr.set_source_rgb(0.18, 0.45, 0.85)
@@ -391,17 +541,21 @@ class JoinCanvas(Gtk.DrawingArea):
         cr.show_text(label)
 
     def _draw_node(
-        self, cr, table: GraphTable, *, selected: bool, hover: bool
+        self,
+        cr,
+        table: GraphTable,
+        *,
+        selected: bool,
+        hover: bool,
+        active_ports: set[tuple[str, str]],
     ) -> None:
         h = _node_height(table)
         x, y = table.x, table.y
 
-        # Shadow
         cr.set_source_rgba(0, 0, 0, 0.08)
         self._round_rect(cr, x + 2, y + 3, NODE_W, h, 8)
         cr.fill()
 
-        # Body
         if selected:
             cr.set_source_rgb(0.93, 0.96, 1.0)
         elif hover:
@@ -418,51 +572,55 @@ class JoinCanvas(Gtk.DrawingArea):
             cr.set_line_width(1.2)
         cr.stroke()
 
-        # Header bar
         cr.save()
-        self._round_rect(cr, x, y, NODE_W, 28, 8)
-        cr.rectangle(x, y + 14, NODE_W, 14)
+        self._round_rect(cr, x, y, NODE_W, HEADER_H, 8)
+        cr.rectangle(x, y + HEADER_H / 2, NODE_W, HEADER_H / 2)
         cr.clip()
         if selected:
             cr.set_source_rgb(0.18, 0.45, 0.85)
         else:
             cr.set_source_rgb(0.22, 0.28, 0.36)
-        cr.rectangle(x, y, NODE_W, 28)
+        cr.rectangle(x, y, NODE_W, HEADER_H)
         cr.fill()
         cr.restore()
 
         cr.set_source_rgb(1, 1, 1)
-        cr.select_font_face("Sans", 0, 1)  # bold
+        cr.select_font_face("Sans", 0, 1)
         cr.set_font_size(12)
-        title = f"`{table.alias}`"
         cr.move_to(x + NODE_PAD, y + 18)
-        cr.show_text(title)
+        cr.show_text(f"`{table.alias}`")
 
-        # FQN
         cr.set_source_rgb(0.35, 0.38, 0.42)
         cr.select_font_face("Sans", 0, 0)
         cr.set_font_size(10)
         fqn = table.ref.fqn
         if len(fqn) > 28:
             fqn = fqn[:25] + "…"
-        cr.move_to(x + NODE_PAD, y + 42)
+        cr.move_to(x + NODE_PAD, y + FQN_BASELINE)
         cr.show_text(fqn)
 
-        # Columns
-        cr.set_source_rgb(0.25, 0.28, 0.32)
-        cr.set_font_size(11)
+        # Highlight join-key column rows lightly.
+        join_cols = {col for _side, col in active_ports}
         cols = table.columns[:NODE_MAX_COLS]
         for i, col in enumerate(cols):
-            cr.move_to(x + NODE_PAD, y + 58 + i * NODE_COL_H)
+            baseline = y + COL_FIRST_BASELINE + i * NODE_COL_H
+            if col in join_cols:
+                cr.set_source_rgba(0.18, 0.45, 0.85, 0.10)
+                cr.rectangle(x + 4, baseline - 12, NODE_W - 8, NODE_COL_H)
+                cr.fill()
+            cr.set_source_rgb(0.25, 0.28, 0.32)
+            cr.set_font_size(11)
+            cr.move_to(x + NODE_PAD, baseline)
             cr.show_text(f"· {col}")
         if len(table.columns) > NODE_MAX_COLS:
             more = len(table.columns) - NODE_MAX_COLS
             cr.set_source_rgb(0.45, 0.48, 0.52)
-            cr.move_to(x + NODE_PAD, y + 58 + len(cols) * NODE_COL_H)
+            cr.move_to(x + NODE_PAD, y + COL_FIRST_BASELINE + len(cols) * NODE_COL_H)
             cr.show_text(f"… +{more} more")
 
-        # Ports
-        for px, py in (_port_left(table), _port_right(table)):
+        # Draw only ports that participate in joins (column-anchored).
+        for side, column in active_ports:
+            px, py = _port(table, column, side=side)
             cr.set_source_rgb(1, 1, 1)
             cr.arc(px, py, PORT_R, 0, 6.2832)
             cr.fill_preserve()
